@@ -1,0 +1,163 @@
+- name: Run k6 load tests for preset URLS projects
+  hosts: loadgen
+  become: yes
+  vars:
+    loadgen_base_dir_default: /opt/loadgen
+    k6_async_timeout: "{{ k6_timeout | default(7200) }}"
+    k6_poll_interval: "{{ k6_poll_seconds | default(30) }}"
+    k6_default_script: k6-script.js
+    k6_pid_file: /tmp/k6.pid
+    preset_urls_project_map: {}
+
+  pre_tasks:
+    - name: Normalize preset_urls_project_map input
+      ansible.builtin.set_fact:
+        preset_urls_project_map_struct: >-
+          {{ (preset_urls_project_map | from_yaml)
+             if (preset_urls_project_map is string and (preset_urls_project_map | trim) not in ['', '{}'])
+             else (preset_urls_project_map if preset_urls_project_map is mapping else {}) }}
+
+    - name: Normalize preset URL project selection for this host
+      ansible.builtin.set_fact:
+        preset_urls_projects_normalized: "{{ preset_urls_project_map_struct.get(inventory_hostname, preset_urls_projects | default([])) if (preset_urls_project_map_struct | length) > 0 else preset_urls_projects | default([]) }}"
+      when: preset_urls_project_map_struct is defined or preset_urls_projects is defined
+
+    - name: Ensure preset_urls_projects argument is supplied
+      ansible.builtin.assert:
+        that:
+          - (preset_urls_projects_normalized is sequence and not (preset_urls_projects_normalized is string) and (preset_urls_projects_normalized | length) > 0)
+            or (preset_urls_projects_normalized is string and (preset_urls_projects_normalized | trim) != '')
+        fail_msg: >-
+          Provide Preset URLS project directories via
+          --extra-vars 'preset_urls_projects=["projectA","projectB"]' or map hosts with
+          preset_urls_project_map={"lg1":["projectA","projectB"],"lg2":["projectC"]}.
+  tasks:
+    - name: Determine Preset URLS project list for this host
+      ansible.builtin.set_fact:
+        preset_urls_projects_list: >-
+          {{ preset_urls_projects_normalized
+             if preset_urls_projects_normalized is sequence and not (preset_urls_projects_normalized is string)
+             else
+             ((preset_urls_projects_normalized | from_yaml)
+              if (preset_urls_projects_normalized is string and (preset_urls_projects_normalized | trim) is match('^\[.*\]$'))
+              else
+              ((preset_urls_projects_normalized | regex_replace('[\n\r]+', ' ') | regex_replace(',', ' ') | regex_replace('\\s+', ' ') | trim | split(' '))
+               if preset_urls_projects_normalized is string
+               else [])) | map('trim') | reject('equalto', '') | list | unique }}
+
+    - name: Fail when no Preset URLS projects remain after normalization
+      ansible.builtin.assert:
+        that:
+          - preset_urls_projects_list | length > 0
+        fail_msg: "No valid Preset URLS project directories supplied."
+    - name: Ensure influxdb_url argument is supplied
+      ansible.builtin.assert:
+        that:
+          - influxdb_url is defined
+          - (influxdb_url | trim) != ''
+        fail_msg: "Provide the control server InfluxDB endpoint via --extra-vars 'influxdb_url=http://control:8086/k6'."
+
+    - name: Determine load generator project root
+      ansible.builtin.set_fact:
+        loadgen_root: "{{ loadgen_base_dir | default(loadgen_base_dir_default) }}"
+        k6_entry_file: "{{ k6_script_file | default(k6_default_script) }}"
+
+    - name: Ensure k6 CLI is installed
+      ansible.builtin.command:
+        cmd: k6 version
+      register: k6_cli_check
+      changed_when: false
+
+    - name: Validate k6 script exists for each project
+      ansible.builtin.stat:
+        path: "{{ loadgen_root }}/projects/preset-urls-project/{{ item }}/{{ k6_entry_file }}"
+      register: preset_urls_k6_scripts
+      loop: "{{ preset_urls_projects_list }}"
+      loop_control:
+        label: "{{ item }}"
+
+    - name: Fail when any k6 script is missing
+      ansible.builtin.fail:
+        msg: >-
+          Missing {{ k6_entry_file }} in {{ loadgen_root }}/projects/preset-urls-project/{{ item.item }}.
+      when: not item.stat.exists
+      loop: "{{ preset_urls_k6_scripts.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+    - name: Ensure Preset URLs project log/result directories exist
+      ansible.builtin.file:
+        path: "{{ loadgen_root }}/projects/preset-urls-project/{{ item.0 }}/{{ item.1 }}"
+        state: directory
+        mode: "0755"
+      loop: "{{ preset_urls_projects_list | product(['logs', 'results']) | list }}"
+      loop_control:
+        label: "{{ item.0 }}/{{ item.1 }}"
+
+    - name: Initialize k6 PID file
+      ansible.builtin.copy:
+        content: ""
+        dest: "{{ k6_pid_file }}"
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Launch k6 for each Preset URLs project
+      ansible.builtin.shell: |
+        set -euo pipefail
+        project="{{ item }}"
+        project_dir="{{ loadgen_root }}/projects/preset-urls-project/${project}"
+        timestamp=$(date +%Y%m%dT%H%M%S)
+        log_file="$project_dir/logs/k6-${project}-$timestamp.log"
+        summary_file="$project_dir/results/k6-${project}-$timestamp.json"
+        pid_file="{{ k6_pid_file }}"
+
+        touch "$pid_file"
+        chmod 0644 "$pid_file"
+
+        TEST_ID="${project}" \
+        K6_OUT="influxdb={{ influxdb_url }}" \
+        k6 run "$project_dir/{{ k6_entry_file }}" \
+          --summary-export "$summary_file" \
+          > "$log_file" 2>&1 &
+        k6_pid=$!
+
+        if command -v flock >/dev/null 2>&1; then
+          {
+            flock 200
+            printf '%s\n' "$k6_pid" >> "$pid_file"
+          } 200>>"$pid_file"
+        else
+          printf '%s\n' "$k6_pid" >> "$pid_file"
+        fi
+
+        wait "$k6_pid"
+      args:
+        executable: /bin/bash
+      loop: "{{ preset_urls_projects_list }}"
+      loop_control:
+        label: "{{ item }}"
+      async: "{{ k6_async_timeout }}"
+      poll: 0
+      register: preset_urls_projects_k6_async_runs
+
+    - name: Wait for k6 runs to finish
+      ansible.builtin.async_status:
+        jid: "{{ item.ansible_job_id }}"
+      register: preset_urls_projects_k6_status
+      until: preset_urls_projects_k6_status.finished
+      retries: "{{ (k6_async_timeout // k6_poll_interval) | int + 1 }}"
+      delay: "{{ k6_poll_interval }}"
+      loop: "{{ preset_urls_projects_k6_async_runs.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+      failed_when: preset_urls_projects_k6_status.rc is defined and preset_urls_projects_k6_status.rc != 0
+
+    - name: Summarize k6 completion
+      ansible.builtin.debug:
+        msg: >-
+          Completed k6 run for {{ item.item }} with return code {{ item.rc | default('unknown') }}.
+          Logs in {{ loadgen_root }}/projects/preset-urls-project/{{ item.item }}/logs and results in {{ loadgen_root }}/projects/preset-urls-project/{{ item.item }}/results.
+      loop: "{{ preset_urls_projects_k6_status.results }}"
+      loop_control:
+        label: "{{ item.item }}"

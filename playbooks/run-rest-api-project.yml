@@ -1,0 +1,166 @@
+---
+- name: Run k6 load tests for Rest API projects
+  hosts: loadgen
+  become: yes
+  vars:
+    loadgen_base_dir_default: /opt/loadgen
+    k6_async_timeout: "{{ k6_timeout | default(7200) }}"
+    k6_poll_interval: "{{ k6_poll_seconds | default(30) }}"
+    k6_default_script: k6_script.js
+    k6_pid_file: /tmp/k6.pid
+    rest_api_projects_map: {}
+
+  pre_tasks:
+    - name: Normalize rest_api_projects_map input
+      ansible.builtin.set_fact:
+        rest_api_projects_map_struct: >-
+          {{ (rest_api_projects_map | from_yaml)
+             if (rest_api_projects_map is string and (rest_api_projects_map | trim) not in ['', '{}'])
+             else (rest_api_projects_map if rest_api_projects_map is mapping else {}) }}
+
+    - name: Normalize REST API project selection for this host
+      ansible.builtin.set_fact:
+        rest_api_projects_normalized: "{{ rest_api_projects_map_struct.get(inventory_hostname, rest_api_projects | default([])) if (rest_api_projects_map_struct | length) > 0 else rest_api_projects | default([]) }}"
+      when: rest_api_projects_map_struct is defined or rest_api_projects is defined
+
+    - name: Ensure rest_api_projects argument is supplied
+      ansible.builtin.assert:
+        that:
+          - (rest_api_projects_normalized is sequence and not (rest_api_projects_normalized is string) and (rest_api_projects_normalized | length) > 0)
+            or (rest_api_projects_normalized is string and (rest_api_projects_normalized | trim) != '')
+        fail_msg: >-
+          Provide REST API project directories via
+          --extra-vars 'rest_api_projects=["projectA","projectB"]' or map hosts with
+          rest_api_projects_map={"lg1":["projectA","projectB"],"lg2":["projectC"]}.
+
+  tasks:
+    - name: Determine REST API project list for this host
+      ansible.builtin.set_fact:
+        rest_api_project_list: >-
+          {{ rest_api_projects_normalized
+             if rest_api_projects_normalized is sequence and not (rest_api_projects_normalized is string)
+             else
+             ((rest_api_projects_normalized | from_yaml)
+              if (rest_api_projects_normalized is string and (rest_api_projects_normalized | trim) is match('^\[.*\]$'))
+              else
+              ((rest_api_projects_normalized | regex_replace('[\n\r]+', ' ') | regex_replace(',', ' ') | regex_replace('\\s+', ' ') | trim | split(' '))
+               if rest_api_projects_normalized is string
+               else [])) | map('trim') | reject('equalto', '') | list | unique }}
+
+    - name: Fail when no REST API projects remain after normalization
+      ansible.builtin.assert:
+        that:
+          - rest_api_project_list | length > 0
+        fail_msg: "No valid REST API project directories supplied."
+
+    - name: Ensure influxdb_url argument is supplied
+      ansible.builtin.assert:
+        that:
+          - influxdb_url is defined
+          - (influxdb_url | trim) != ''
+        fail_msg: "Provide the control server InfluxDB endpoint via --extra-vars 'influxdb_url=http://control:8086/k6'."
+
+    - name: Determine load generator project root
+      ansible.builtin.set_fact:
+        loadgen_root: "{{ loadgen_base_dir | default(loadgen_base_dir_default) }}"
+        k6_entry_file: "{{ k6_script_file | default(k6_default_script) }}"
+
+    - name: Ensure k6 CLI is installed
+      ansible.builtin.command:
+        cmd: k6 version
+      register: k6_cli_check
+      changed_when: false
+
+    - name: Validate k6 script exists for each project
+      ansible.builtin.stat:
+        path: "{{ loadgen_root }}/projects/rest-api-project/{{ item }}/{{ k6_entry_file }}"
+      register: rest-api_k6_scripts
+      loop: "{{ rest_api_project_list }}"
+      loop_control:
+        label: "{{ item }}"
+
+    - name: Fail when any k6 script is missing
+      ansible.builtin.fail:
+        msg: >-
+          Missing {{ k6_entry_file }} in {{ loadgen_root }}/projects/rest-api-project/{{ item.item }}.
+      when: not item.stat.exists
+      loop: "{{ rest-api_k6_scripts.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+    - name: Ensure REST API project log/result directories exist
+      ansible.builtin.file:
+        path: "{{ loadgen_root }}/projects/rest-api-project/{{ item.0 }}/{{ item.1 }}"
+        state: directory
+        mode: "0755"
+      loop: "{{ rest_api_project_list | product(['logs', 'results']) | list }}"
+      loop_control:
+        label: "{{ item.0 }}/{{ item.1 }}"
+
+    - name: Initialize k6 PID file
+      ansible.builtin.copy:
+        content: ""
+        dest: "{{ k6_pid_file }}"
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Launch k6 for each REST API project
+      ansible.builtin.shell: |
+        set -euo pipefail
+        project="{{ item }}"
+        project_dir="{{ loadgen_root }}/projects/rest-api-project/${project}"
+        timestamp=$(date +%Y%m%dT%H%M%S)
+        log_file="$project_dir/logs/k6-${project}-$timestamp.log"
+        summary_file="$project_dir/results/k6-${project}-$timestamp.json"
+        pid_file="{{ k6_pid_file }}"
+
+        touch "$pid_file"
+        chmod 0644 "$pid_file"
+
+        TEST_ID="${project}" \
+        K6_OUT="influxdb={{ influxdb_url }}" \
+        k6 run "$project_dir/{{ k6_entry_file }}" \
+          --summary-export "$summary_file" \
+          > "$log_file" 2>&1 &
+        k6_pid=$!
+
+        if command -v flock >/dev/null 2>&1; then
+          {
+            flock 200
+            printf '%s\n' "$k6_pid" >> "$pid_file"
+          } 200>>"$pid_file"
+        else
+          printf '%s\n' "$k6_pid" >> "$pid_file"
+        fi
+
+        wait "$k6_pid"
+      args:
+        executable: /bin/bash
+      loop: "{{ rest_api_project_list }}"
+      loop_control:
+        label: "{{ item }}"
+      async: "{{ k6_async_timeout }}"
+      poll: 0
+      register: rest_api_k6_async_runs
+
+    - name: Wait for k6 runs to finish
+      ansible.builtin.async_status:
+        jid: "{{ item.ansible_job_id }}"
+      register: rest_api_k6_status
+      until: rest_api_k6_status.finished
+      retries: "{{ (k6_async_timeout // k6_poll_interval) | int + 1 }}"
+      delay: "{{ k6_poll_interval }}"
+      loop: "{{ rest_api_k6_async_runs.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+      failed_when: rest_api_k6_status.rc is defined and rest_api_k6_status.rc != 0
+
+    - name: Summarize k6 completion
+      ansible.builtin.debug:
+        msg: >-
+          Completed k6 run for {{ item.item }} with return code {{ item.rc | default('unknown') }}.
+          Logs in {{ loadgen_root }}/projects/rest-api-project/{{ item.item }}/logs and results in {{ loadgen_root }}/projects/rest-api-project/{{ item.item }}/results.
+      loop: "{{ rest_api_k6_status.results }}"
+      loop_control:
+        label: "{{ item.item }}"

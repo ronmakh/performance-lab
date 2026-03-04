@@ -1,0 +1,125 @@
+---
+- name: Setup controller_group server (InfluxDB & Grafana)
+  hosts: control
+  become: yes
+  tasks:
+    # - name: Install Docker & Docker Compose
+    #   apt:
+    #     name:
+    #       - docker.io
+    #       - docker-compose
+    #       - docker-compose-plugin
+    #     state: present
+    #     update_cache: yes
+
+    # - name: Ensure monitoring directory exists
+    #   file:
+    #     path: /opt/monitoring
+    #     state: directory
+    #     mode: "0755"
+
+    # - name: Copy Grafana provisioning files
+    #   copy:
+    #     src: grafana/
+    #     dest: /opt/monitoring/grafana/
+    #     mode: "0644"
+    #     directory_mode: "0755"
+
+    # - name: Copy docker-compose for InfluxDB & Grafana
+    #   copy:
+    #     src: docker-compose-monitoring.yml
+    #     dest: /opt/monitoring/docker-compose.yml
+    #     mode: 0644
+
+    # - name: Start InfluxDB and Grafana stack
+    #   ansible.builtin.shell: |
+    #     set -euo pipefail
+    #     docker compose -f /opt/monitoring/docker-compose.yml up -d
+    #   args:
+    #     executable: /bin/bash
+
+    # - name: Wait for InfluxDB to be ready
+    #   uri:
+    #     url: http://localhost:8086/health
+    #     method: GET
+    #     status_code: 200
+    #   register: influx_health
+    #   retries: 10
+    #   delay: 5
+    #   until: influx_health.status == 200
+
+- name: Setup load generator nodes
+  hosts: loadgen
+  become: yes
+
+  tasks:
+    # - name: Install Docker & Docker Compose
+    #   apt:
+    #     name:
+    #       - docker.io
+    #       - docker-compose
+    #       - docker-compose-plugin
+    #     state: present
+    #     update_cache: yes
+    - name: Ensure k6 is installed at desired version
+      block:
+        - name: Check if k6 is installed
+          ansible.builtin.command: k6 version
+          register: k6_check
+          ignore_errors: true
+
+        - name: Install latest k6 (portable binary)
+          ansible.builtin.shell: |
+            set -euo pipefail
+            ARCH="$(dpkg --print-architecture)"
+            case "$ARCH" in
+              amd64)  K6_ARCH="x64" ;;
+              arm64)  K6_ARCH="arm64" ;;
+              armhf)  K6_ARCH="arm" ;;
+              *) echo "Unsupported arch: $ARCH" >&2; exit 1 ;;
+            esac
+            # Get latest version from GitHub
+            VER="$(curl -sIL -o /dev/null -w '%{url_effective}\n' https://github.com/grafana/k6/releases/latest | sed 's#.*/##')"
+            URL="https://github.com/grafana/k6/releases/download/${VER}/k6-${VER}-linux-${K6_ARCH}.tar.gz"
+            TMPD="$(mktemp -d)"; cd "$TMPD"
+            curl -fsSL "$URL" -o k6.tgz
+            tar -xzf k6.tgz
+            BIN="$(echo k6-*-linux-* | head -n1)/k6"
+            install -m 0755 "$BIN" /usr/local/bin/k6
+            rm -rf "$TMPD"
+          args:
+            executable: /bin/bash
+  
+    - name: Install Node.js
+      ansible.builtin.shell: |
+        if ! command -v node &> /dev/null; then
+          curl -fsSL https://deb.nodesource.com/setup_current.x | sudo -E bash -
+          sudo apt-get install -y nodejs
+        fi
+      args:
+        executable: /bin/bash
+
+    - name: Create loadgen directory
+      file:
+        path: /opt/loadgen
+        state: directory
+        mode: 0755
+
+    - name: Copy loadgen Docker Compose and test files
+      copy:
+        src: ../loadgen/
+        dest: /opt/loadgen/
+        mode: 0755
+
+    - name: Install fast-xml-parser locally in Preset URLsproject
+      ansible.builtin.shell: |
+        cd /opt/loadgen/projects/preset-urls-project && npm install fast-xml-parser
+      args:
+        executable: /bin/bash
+
+    # - name: Start load generator Docker stack
+    #   ansible.builtin.shell: |
+    #     set -euo pipefail
+    #     docker compose -f /opt/loadgen/docker-compose.yml up -d
+    #   args:
+    #     executable: /bin/bash

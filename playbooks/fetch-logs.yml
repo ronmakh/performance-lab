@@ -1,0 +1,144 @@
+---
+- name: Fetch k6 logs and results from load generators
+  hosts: loadgen
+  gather_facts: false
+  vars:
+    loadgen_base_dir_default: /opt/loadgen
+    log_file_patterns:
+      - "*.log"
+    result_file_patterns:
+      - "*.json"
+      - "*.csv"
+    local_results_root: "{{ playbook_dir }}/../results"
+    project_list: []
+    project_name: "preset-urls-project"
+    k6_log_dir_name: logs
+    k6_results_dir_name: results
+
+  tasks:
+    - name: Determine load generator base directory
+      ansible.builtin.set_fact:
+        loadgen_root: "{{ loadgen_base_dir | default(loadgen_base_dir_default) }}"
+        local_host_results_dir: "{{ local_results_root }}/{{ inventory_hostname }}"
+
+    - name: Determine project list from extra vars
+      ansible.builtin.set_fact:
+        project_list_normalized: "{{ project_list }}"
+      when: (project_list | length) > 0
+
+    - name: Automatically discover project list when not provided
+      ansible.builtin.find:
+        paths: "{{ loadgen_root }}/projects/{{ project_name }}"
+        file_type: directory
+        depth: 1
+      register: project_discovery
+      when: ( project_list | length) == 0
+
+    - name: Set project list from discovery
+      ansible.builtin.set_fact:
+        project_list_normalized: "{{ project_discovery.files | map(attribute='path') | map('basename') | list }}"
+      when:
+        - project_list_normalized is not defined
+        - project_discovery is defined
+
+    - name: Ensure at least one project is selected
+      ansible.builtin.assert:
+        that:
+          - project_list_normalized is defined
+          - project_list_normalized | length > 0
+        fail_msg: "No project directories found under {{ loadgen_root }}/projects/{{ project_name }}"
+
+    - name: Ensure local results directories exist
+      delegate_to: localhost
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0755"
+      loop:
+        - "{{ local_results_root }}"
+        - "{{ local_host_results_dir }}"
+        - "{{ local_host_results_dir }}/{{ k6_log_dir_name }}"
+        - "{{ local_host_results_dir }}/{{ k6_results_dir_name }}"
+
+    - name: Build remote log and result paths per project
+      ansible.builtin.set_fact:
+        remote_log_searches: "{{ project_list_normalized | map('regex_replace', '^(.*)$', loadgen_root + '/projects/' + project_name + '/\\1/' + k6_log_dir_name) | list }}"
+        remote_result_searches: "{{ project_list_normalized | map('regex_replace', '^(.*)$', loadgen_root + '/projects/' + project_name + '/\\1/' + k6_results_dir_name) | list }}"
+
+    - name: Inspect remote log directories
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      loop: "{{ remote_log_searches }}"
+      register: remote_log_dir_stats
+      failed_when: false
+      changed_when: false
+
+    - name: Inspect remote result directories
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      loop: "{{ remote_result_searches }}"
+      register: remote_result_dir_stats
+      failed_when: false
+      changed_when: false
+
+    - name: Locate log files on load generator
+      ansible.builtin.find:
+        paths: "{{ item.item }}"
+        patterns: "{{ log_file_patterns }}"
+        file_type: file
+        recurse: true
+        follow: false
+      loop: "{{ remote_log_dir_stats.results }}"
+      when: item.stat.exists and item.stat.isdir | default(false)
+      register: remote_log_find_results
+      failed_when: false
+
+    - name: Locate result files on load generator
+      ansible.builtin.find:
+        paths: "{{ item.item }}"
+        patterns: "{{ result_file_patterns }}"
+        file_type: file
+        recurse: true
+        follow: false
+      loop: "{{ remote_result_dir_stats.results }}"
+      when: item.stat.exists and item.stat.isdir | default(false)
+      register: remote_result_find_results
+      failed_when: false
+
+    - name: Select latest log file per project
+      ansible.builtin.set_fact:
+        remote_log_files: "{{ (remote_log_files | default([])) + ((latest_log_file is not none) | ternary([latest_log_file], [])) }}"
+      vars:
+        sorted_log_files: "{{ item.files | default([]) | sort(attribute='mtime', reverse=True) }}"
+        latest_log_file: "{{ sorted_log_files[0] if (sorted_log_files | length) > 0 else None }}"
+      loop: "{{ (remote_log_find_results | default({'results': []})).results }}"
+
+    - name: Select latest result file per project
+      ansible.builtin.set_fact:
+        remote_result_files: "{{ (remote_result_files | default([])) + ((latest_result_file is not none) | ternary([latest_result_file], [])) }}"
+      vars:
+        sorted_result_files: "{{ item.files | default([]) | sort(attribute='mtime', reverse=True) }}"
+        latest_result_file: "{{ sorted_result_files[0] if (sorted_result_files | length) > 0 else None }}"
+      loop: "{{ (remote_result_find_results | default({'results': []})).results }}"
+
+    - name: Fetch k6 log files
+      ansible.builtin.fetch:
+        src: "{{ item.path }}"
+        dest: "{{ local_host_results_dir }}/{{ k6_log_dir_name }}/"
+        flat: true
+      loop: "{{ remote_log_files | default([]) }}"
+      when: (remote_log_files | default([])) | length > 0
+
+    - name: Fetch k6 result files
+      ansible.builtin.fetch:
+        src: "{{ item.path }}"
+        dest: "{{ local_host_results_dir }}/{{ k6_results_dir_name }}/"
+        flat: true
+      loop: "{{ remote_result_files | default([]) }}"
+      when: (remote_result_files | default([])) | length > 0
+
+    - name: Report fetched file counts
+      ansible.builtin.debug:
+        msg: >-
+          Collected {{ (remote_log_files | default([])) | length }} log files and
+          {{ (remote_result_files | default([])) | length }} result files from {{ inventory_hostname }}

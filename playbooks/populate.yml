@@ -1,0 +1,94 @@
+---
+- name: Populate Preset URLs test data on load generators
+  hosts: loadgen
+  become: yes
+
+  tasks:
+    - name: Ensure site argument is provided
+      ansible.builtin.fail:
+        msg: "Provide --extra-vars 'site=<site_name>' when running this playbook."
+      when: site is not defined or (site is defined and site is string and (site | trim) == '')
+
+    - name: Fail when site argument contains multiple entries
+      ansible.builtin.fail:
+        msg: "Provide a single site via --extra-vars 'site=<site_name>'."
+      when:
+        - site is defined
+        - site is sequence
+        - not (site is string)
+
+    - name: Normalize site argument
+      ansible.builtin.set_fact:
+        preset_urls_site: "{{ site | trim }}"
+      when:
+        - site is defined
+        - site is string
+
+    - name: Ingest sitemapUrls argument when provided as list
+      ansible.builtin.set_fact:
+        preset_urls_sitemap_urls: "{{ sitemapUrls | map('trim') | reject('equalto', '') | list }}"
+      when:
+        - sitemapUrls is defined
+        - sitemapUrls is sequence
+        - not (sitemapUrls is string)
+
+    - name: Parse sitemapUrls list string
+      ansible.builtin.set_fact:
+        preset_urls_sitemap_urls: "{{ (sitemapUrls | from_yaml) | map('trim') | reject('equalto', '') | list }}"
+      when:
+        - sitemapUrls is defined
+        - sitemapUrls is string
+        - (sitemapUrls | trim) is match('^\[.*\]$')
+
+    - name: Ingest sitemapUrls argument when provided as string
+      ansible.builtin.set_fact:
+        preset_urls_sitemap_urls: "{{ (sitemapUrls | regex_replace('[\n\r]+', ' ') | regex_replace('\\s+', ' ') | trim | split(' ')) | reject('equalto', '') | list }}"
+      when:
+        - sitemapUrls is defined
+        - sitemapUrls is string
+        - (sitemapUrls | trim) != ''
+        - preset_urls_sitemap_urls is not defined
+
+    - name: Fail when sitemap URLs are not provided
+      ansible.builtin.fail:
+        msg: "Provide sitemapUrls via --extra-vars 'sitemapUrls=[\"https://example.com/sitemap.xml\"]'."
+      when: (preset_urls_sitemap_urls | default([])) | length == 0
+
+    - name: Normalize generate_404 flag
+      ansible.builtin.set_fact:
+        preset_urls_generate_404: "{{ generate_404 | default(false) | bool }}"
+
+    - name: Default Preset URLs data file when not provided
+      ansible.builtin.set_fact:
+        preset_urls_data_file: "{{ preset_urls_data_file | default('populate.js') }}"
+
+    - name: Show inputs
+      ansible.builtin.debug:
+        msg: >-
+          Site: {{ preset_urls_site }}, sitemapUrls: {{ preset_urls_sitemap_urls }},
+          populate_script: {{ preset_urls_data_file }}, include_404: {{ preset_urls_generate_404 }}
+
+    - name: Generate sitemap URLs for Preset URLs site
+      ansible.builtin.command:
+        argv: "{{ ['node', '/opt/loadgen/projects/preset-urls-project/get-sitemap-urls.js', '--site', preset_urls_site] + preset_urls_sitemap_urls }}"
+      register: preset_urls_sitemap_result
+      when: preset_urls_sitemap_urls | length > 0
+
+    - name: Generate sitemap URLs with 404 entries when enabled
+      ansible.builtin.command:
+        argv: "{{ ['node', '/opt/loadgen/projects/preset-urls-project/get-sitemap-urls-404.js', '--site', preset_urls_site] + preset_urls_sitemap_urls }}"
+      when:
+        - preset_urls_generate_404
+        - preset_urls_sitemap_urls | length > 0
+
+    - name: Run Preset URLs populate script with Node.js
+      ansible.builtin.command:
+        argv: "{{ ['node', '/opt/loadgen/projects/preset-urls-project/' + preset_urls_data_file]
+                  + (['--site', preset_urls_site] if preset_urls_site is defined else [])
+                  + (preset_urls_sitemap_urls | default([])) }}"
+      register: populate_result
+      ignore_errors: yes
+
+    - name: Show populate output
+      ansible.builtin.debug:
+        msg: "{{ populate_result.stdout }}"

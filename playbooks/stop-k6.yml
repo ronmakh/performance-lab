@@ -1,0 +1,23 @@
+---
+- name: Stop k6 load test gracefully
+  hosts: loadgen
+  become: yes
+  vars:
+    k6_pid_file: /tmp/k6.pid
+
+  tasks:
+    - name: Check if k6 PID file exists
+      ansible.builtin.stat:
+        path: "{{ k6_pid_file }}"
+      register: pid_file_status
+
+    - name: Stop k6 process with SIGINT (Ctrl+C equivalent)
+      ansible.builtin.shell: |
+        kill -2 $(cat {{ k6_pid_file }}) && echo "k6 stopped gracefully"
+      when: pid_file_status.stat.exists
+
+    - name: Remove PID file
+      ansible.builtin.file:
+        path: "{{ k6_pid_file }}"
+        state: absent
+      when: pid_file_status.stat.exists
